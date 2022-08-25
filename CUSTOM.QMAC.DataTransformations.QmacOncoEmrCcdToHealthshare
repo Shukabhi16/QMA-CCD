@@ -1,0 +1,1205 @@
+Include (HS.Errors, HS.Common)
+
+Class CUSTOM.QMAC.DataTransformations.QmacOncoEmrCcdToHealthshare Extends (Ens.BusinessProcess, HS.Util.XSLTTransformer, HS.Util.Trace.Helper, HS.Util.Trace.Performance) [ ClassType = persistent, Inheritance = left ]
+{
+
+Parameter INVOCATION = "Queue";
+
+Parameter SETTINGS = "-ServiceName,XSLTCallbackHandlerClass,Target,CDALoggingConfig,CDALoggingPath,-TargetName";
+
+Property XSLTCallbackHandlerClass As Ens.DataType.Class [ InitialExpression = "CUSTOM.IHE.Util.XSLTCallbackHelper" ];
+
+/// XSLT transformer callback class name
+/// Defaults to HS.Util.XSLTHelper
+/// Instance of the callback handler for isc:evaluate() functions
+Property Target As Ens.DataType.ConfigName [ InitialExpression = "HS.Gateway.ECR.Manager" ];
+
+// Default CDA Logging is turned off
+
+Property CDALoggingConfig As %Boolean [ InitialExpression = 0 ];
+
+Property CDALoggingPath As Ens.DataType.ConfigName;
+
+Method OnRequest(pRequest As %Persistent, Output pResponse As %Persistent) As %Status
+{
+	Set tSC = $$$OK
+	Try {
+		
+		Set pResponse = ##class(HS.Message.XMLMessage).%New()
+		Set tRequest = ##class(HS.Message.ECRUpdateRequest).%New()
+		Set tRequest.StreamContentType = "SDA3"
+
+		If pRequest.%IsA("HS.Message.XMLMessage") {
+			
+		// Transform using embedded XSLT
+		#dim tTargetMessage As HS.Message.XMLMessage		
+		Set tXsltName="CdaToCdaTransformation"
+		Set xslt=##class(%Dictionary.XDataDefinition).%OpenId(..%ClassName(1)_"||"_tXsltName,-1,.tSC)		
+		$$$ThrowOnError(tSC)
+			
+		Set tCallBackHandler = $ClassMethod(..XSLTCallbackHandlerClass,"%New")
+		
+    	Set tSC= ##class(%XML.XSLT.Transformer).TransformStream(pRequest.ContentStream,xslt.Data,.tTargetMessage,,,tCallBackHandler)		
+   		$$$ThrowOnError(tSC) 
+   		
+   		//DEBUGGING: Use process parameters to set logging. Logging is disabled in PROD. 
+		Set tEnv = $GET(^zEnvFlag)
+		
+		Set tFileNamePre = "QmacOncoEmrCdaToHealthshare"_$TR($ZDT($ZTIMESTAMP,8,1,3),": .","")_"CDA_PRE.xml"
+		Set tFileNamePost = "QmacOncoEmrCdaToHealthshare"_$TR($ZDT($ZTIMESTAMP,8,1,3),": .","")_"CDA_POST.xml"
+		Set tSource = pRequest.ContentStream
+		Set tTarget = tTargetMessage
+		If tEnv '= "PROD" {
+		   If (..CDALoggingConfig'=0)&&(..CDALoggingPath'="") {
+			    //Write CD Pre-transform
+				Do tSource.Rewind()
+				Set tFile = ..CDALoggingPath_tFileNamePre
+				Open tFile:"WNS"
+				Set tOldIO = $IO Use tFile Do tSource.OutputToDevice() Use tOldIO
+				Close tFile
+			   }
+		}
+		
+		//Call out to interface specific method
+		
+		Set pResponse = ##class(HS.Message.XMLMessage).%New()
+		Set pResponse.Name = pRequest.Name	
+		Set pResponse.DocType = pRequest.DocType
+		Set pResponse.AdditionalInfo = pRequest.AdditionalInfo
+		Set pResponse.ContentStream = tTarget
+		
+		//Disable CDA logging in PROD
+		If tEnv '= "PROD" {
+		   If (..CDALoggingConfig'=0)&&(..CDALoggingPath'="") {
+			    //Write CD Pre-transform
+				Do tTarget.Rewind()
+				Set tFile = ..CDALoggingPath_tFileNamePost
+				Open tFile:"WNS"
+				Set tOldIO = $IO Use tFile Do tTarget.OutputToDevice() Use tOldIO
+				Close tFile
+			   }
+		}		    		
+		
+		#; Transform document body to SDA	    
+		//Find standard CCDA to SDA transform routine
+	    Set tSC = ##class(HS.IHE.CodedEntry).GetFormatToSDA("2.16.840.1.113883.10.20.22.1.2","C-CDA", .tTransform) $$$ThrowOnError(tSC)
+	       	
+		If (tTransform = ""){
+			$$$ThrowStatus($$$ERROR($$$GeneralError, "No SDA transformation defined for format code '" _ pRequest.AdditionalInfo.GetAt("documentFormatCode") _ "'"))
+		}
+		   	
+		//Transform CCDA to SDA
+		Set tSC = ..Transform(tTargetMessage, tTransform, .tSDAStream) 
+		$$$ThrowOnError(tSC)
+		   	
+		If '(tSDAStream.SizeGet()>0){
+			Set tSC = $$$ERROR($$$GeneralError, "SDA not generated from CCD  " _ pRequest.%ClassName(1)) 
+		$$$ThrowOnError(tSC)
+    	}	
+		   	
+		//Create ECRUpdateRequest to send SDA to handler
+		Set tAction = pRequest.AdditionalInfo.GetAt("SOAPAction")
+		Set tRequest.ContentStream = tSDAStream
+		Set tSC = ..SendRequestSync(..Target, tRequest, .tResponse)
+		$$$ThrowOnError(tSC)
+		    
+		}
+		Else {
+			Set tSC = $$$ERROR($$$GeneralError, "Unknown Message Type:  " _ pRequest.%ClassName(1)) $$$ThrowOnError(tSC)
+		}
+	}
+	Catch eException {
+		Set tSC = eException.AsStatus()
+		$$$LOGINFO("Error"_$zcvt($system.Status.GetErrorText(tSC),"O","XML"))
+	}
+		
+	Quit tSC
+}
+
+XData CdaToCdaTransformation
+{
+<?xml version="1.0"?>
+<xsl:stylesheet xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="urn:hl7-org:v3"
+    xmlns:hl7="urn:hl7-org:v3" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="2.0"
+    xmlns:isc="http://extension-functions.intersystems.com" exclude-result-prefixes="hl7 isc">
+    <xsl:output method="xml" indent="yes" omit-xml-declaration="yes"/>
+
+    <!--set OIDS to be used in mapping -->
+    <xsl:variable name="qmacOID" select="isc:evaluate('CodetoOID', 'QMAC')"/>
+
+    <!--set Performer OIDS to be used in mapping -->
+    <xsl:variable name="PerformerCodeSys"
+        select="/hl7:ClinicalDocument/hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:functionCode/@codeSystem"/>
+
+    <!--Copy the complete input CCD in the beginning-->
+    <xsl:template match="//@* | //node()">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Remove extensions which are causing issues -->
+    <xsl:template match="//hl7:representedOrganization/hl7:id/@extension"/>
+    <xsl:template match="//hl7:providerOrganization/hl7:id/@extension"/>
+    <xsl:template match="//hl7:healthCareFacility/hl7:id/@extension"/>
+    <!--Remove Primary Provider
+    <xsl:template match="/hl7:ClinicalDocument/hl7:documentationOf"/>-->
+
+    <!-- Remove multiple Author value -->
+    <xsl:template match="//hl7:author/hl7:assignedAuthor/hl7:representedOrganization"/>
+
+    <!-- Block Encounter -->
+    <xsl:template match="//hl7:ClinicalDocument/hl7:componentOf/hl7:encompassingEncounter"/>
+
+    <!-- Replace root value with QMAC OIDS -->
+    <xsl:template match="//hl7:representedOrganization/hl7:id">
+        <xsl:copy>
+            <xsl:attribute name="root">
+                <xsl:value-of select="$qmacOID"/>
+            </xsl:attribute>
+        </xsl:copy>
+    </xsl:template>
+
+    <xsl:template match="//hl7:representedOrganization/hl7:id/@root">
+        <xsl:attribute name="root">
+            <xsl:value-of select="$qmacOID"/>
+        </xsl:attribute>
+    </xsl:template>
+
+    <xsl:template match="//hl7:providerOrganization/hl7:id/@root">
+        <xsl:attribute name="root">
+            <xsl:value-of select="$qmacOID"/>
+        </xsl:attribute>
+    </xsl:template>
+
+    <xsl:template
+        match="//hl7:recordTarget/hl7:patientRole/hl7:id/@root[string() = '1.3.6.1.4.1.44231.2']">
+        <xsl:attribute name="root">
+            <xsl:value-of select="$qmacOID"/>
+        </xsl:attribute>
+    </xsl:template>
+
+    <xsl:template match="//hl7:recordTarget/hl7:patientRole/hl7:id/@extension">
+        <xsl:attribute name="extension">
+            <xsl:value-of select="number(.)"/>
+        </xsl:attribute>
+    </xsl:template>
+
+    <xsl:template match="//hl7:healthCareFacility/hl7:id/@root">
+        <xsl:attribute name="root">
+            <xsl:value-of select="$qmacOID"/>
+        </xsl:attribute>
+    </xsl:template>
+
+    <!-- Modify Author -->
+    <xsl:template match="/hl7:ClinicalDocument/hl7:author/hl7:assignedAuthor">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <xsl:element name="representedOrganization">
+                <xsl:element name="id">
+                    <xsl:attribute name="root">
+                        <xsl:value-of select="$qmacOID"/>
+                    </xsl:attribute>
+                </xsl:element>
+                <xsl:element name="name">
+                    <xsl:value-of select="isc:evaluate('getDescriptionForOID', $qmacOID)"/>
+                </xsl:element>
+                <xsl:element name="telecom">
+                    <xsl:attribute name="use">
+                        <xsl:value-of select="'WP'"/>
+                    </xsl:attribute>
+                    <xsl:attribute name="value">
+                        <xsl:value-of select="./hl7:representedOrganization/hl7:telecom/@value"/>
+                    </xsl:attribute>
+                </xsl:element>
+                <xsl:apply-templates select="./hl7:representedOrganization/hl7:addr"/>
+            </xsl:element>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- PCP -->
+    <!-- QMAC is sending Provoider codesystem as '2.16.840.1.113883.12.443' but HS wants '2.16.840.1.113883.5.88' in case of CDA doscument. -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:functionCode/@codeSystem[string() ='2.16.840.1.113883.12.443']">
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="'2.16.840.1.113883.5.88'"/>
+            </xsl:attribute>
+         <xsl:attribute name="code">
+                <xsl:value-of select="'PCP'"/>
+            </xsl:attribute>
+    </xsl:template>
+    
+        <xsl:template
+        match="//hl7:ClinicalDocument/hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:functionCode/@codeSystem[string() ='2.16.840.1.113883.5.88']">
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="'2.16.840.1.113883.5.88'"/>
+            </xsl:attribute>
+         <xsl:attribute name="code">
+                <xsl:value-of select="'PCP'"/>
+            </xsl:attribute>
+    </xsl:template>
+
+    <!-- Remove Mappings -->
+    <xsl:template match="//hl7:recordTarget/hl7:patientRole/hl7:addr"/>
+    <xsl:template match="//hl7:recordTarget/hl7:patientRole/hl7:telecom"/>
+    <xsl:template
+        match="//hl7:recordTarget/hl7:patientRole/hl7:patient/hl7:administrativeGenderCode"/>
+    <xsl:template match="//hl7:recordTarget/hl7:patientRole/hl7:patient/hl7:maritalStatusCode"/>
+    <xsl:template match="//hl7:recordTarget/hl7:patientRole/hl7:patient/hl7:raceCode"/>
+    <xsl:template match="//hl7:recordTarget/hl7:patientRole/hl7:patient/hl7:ethnicGroupCode"/>
+    <xsl:template match="//hl7:recordTarget/hl7:patientRole/hl7:patient/hl7:languageCommunication"/>
+    <xsl:template
+        match="//hl7:recordTarget/hl7:patientRole/hl7:patient/hl7:religiousAffiliationCode"/>
+    <xsl:template match="/hl7:ClinicalDocument/hl7:participant[@typeCode = 'IND']"/>
+    <xsl:template match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section/hl7:entry/hl7:act/hl7:entryRelationship/hl7:observation/hl7:text"/>
+    
+
+
+    <!-- ALLERGY -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.6.1']">
+        <xsl:copy>
+            <!--OID to set ActionCode to Innactivate All -->
+            <templateId typeCode="action" root="2.16.840.1.113883.3.632.6.1.2"/>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Code -->
+    <xsl:template
+        match="/hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.6.1']/hl7:entry/hl7:act/hl7:entryRelationship[@typeCode = 'SUBJ']/hl7:observation/hl7:participant/hl7:participantRole/hl7:playingEntity/hl7:code">
+        <xsl:copy>
+            <xsl:attribute name="code">
+                <xsl:value-of select="translate(string(./@code), ' ', '-')"/>
+            </xsl:attribute>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="normalize-space(string(./@displayName))"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Alternate Code -->
+    <xsl:template
+        match="/hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.6.1']/hl7:entry/hl7:act/hl7:entryRelationship[@typeCode = 'SUBJ']/hl7:observation/hl7:participant/hl7:participantRole/hl7:playingEntity/hl7:code/hl7:translation">
+        <xsl:copy>
+            <xsl:attribute name="code">
+                <xsl:value-of select="translate(string(./@code), ' ', '-')"/>
+            </xsl:attribute>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="normalize-space(string(./@displayName))"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Category -->
+    <xsl:template
+        match="/hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.6.1']/hl7:entry/hl7:act/hl7:entryRelationship[@typeCode = 'SUBJ']/hl7:observation/hl7:value">
+        <xsl:copy>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="normalize-space(string(./@displayName))"/>
+            </xsl:attribute>
+            <xsl:attribute name="code">
+                <xsl:value-of select="translate(string(./@code), ' ', '-')"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Reaction -->
+    <xsl:template
+        match="/hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.6.1']/hl7:entry/hl7:act/hl7:entryRelationship[@typeCode = 'SUBJ']/hl7:observation">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <xsl:element name="entryRelationship">
+                <xsl:attribute name="typeCode">
+                    <xsl:value-of select="'MFST'"/>
+                </xsl:attribute>
+                <xsl:element name="observation">
+                    <xsl:element name="value">
+                        <xsl:attribute name="code">
+                            <xsl:value-of select="./hl7:value/@code"/>
+                        </xsl:attribute>
+                        <xsl:attribute name="displayName">
+                            <xsl:value-of select="./hl7:value//@displayName"/>
+                        </xsl:attribute>
+                        <xsl:attribute name="codeSystem">
+                            <xsl:value-of select="./hl7:value/@codeSystem"/>
+                        </xsl:attribute>
+                    </xsl:element>
+                </xsl:element>
+            </xsl:element>
+
+        </xsl:copy>
+    </xsl:template>
+	
+	<!-- Allergy entering facility -->
+	<!-- Allergy entry collection time -->
+    <!-- Identifying provider -->
+    <xsl:template
+        match="/hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.6.1']/hl7:entry/hl7:act">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <xsl:element name="author">
+                <xsl:element name="time">
+                    <xsl:attribute name="value">
+                        <xsl:value-of select="./hl7:effectiveTime/hl7:low/@value"/>
+                    </xsl:attribute>
+                </xsl:element>
+                <xsl:apply-templates select="//hl7:ClinicalDocument/hl7:author/hl7:assignedAuthor"/>
+            </xsl:element>
+            <xsl:element name="performer">
+                <xsl:element name="assignedEntity">
+                    <xsl:element name="id">
+                        <xsl:attribute name="root">
+                            <xsl:value-of select="$qmacOID"/>
+                        </xsl:attribute>
+                    </xsl:element>
+                    <xsl:element name="code">
+                        <xsl:attribute name="code">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:code/@code"
+                            />
+                        </xsl:attribute>
+                        <xsl:attribute name="displayName">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:code/@displayName"
+                            />
+                        </xsl:attribute>
+                        <xsl:attribute name="codeSystem">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:code/@codeSystem"
+                            />
+                        </xsl:attribute>
+                        <xsl:attribute name="codeSystemName">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:code/@codeSystemName"
+                            />
+                        </xsl:attribute>
+                    </xsl:element>
+                    <xsl:element name="assignedPerson">
+                        <xsl:element name="name">
+                            <xsl:element name="given">
+                                <xsl:value-of
+                                    select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:assignedPerson/hl7:name/hl7:given"
+                                />
+                            </xsl:element>
+                            <xsl:element name="family">
+                                <xsl:value-of
+                                    select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:assignedPerson/hl7:name/hl7:family"
+                                />
+                            </xsl:element>
+                        </xsl:element>
+
+
+                    </xsl:element>
+                    <xsl:element name="telecom">
+                        <xsl:attribute name="use">
+                            <xsl:value-of select="'WP'"/>
+                        </xsl:attribute>
+                        <xsl:attribute name="value">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:representedOrganization/hl7:telecom/@value"
+                            />
+                        </xsl:attribute>
+                    </xsl:element>
+			                    <xsl:apply-templates
+			                        select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer[1]/hl7:assignedEntity/hl7:addr"
+			                    />                  
+
+                </xsl:element>
+                <xsl:element name="functionCode">
+                    <xsl:if
+                        test="$PerformerCodeSys = '2.16.840.1.113883.12.443' or $PerformerCodeSys = '2.16.840.1.113883.5.88'">
+                        <xsl:attribute name="code">
+                            <xsl:value-of select="'PCP'"/>
+                        </xsl:attribute>
+                        <xsl:attribute name="codeSystem">
+                            <xsl:value-of select="'2.16.840.1.113883.5.88'"/>
+                        </xsl:attribute>
+                    </xsl:if>
+                    <xsl:attribute name="displayName">
+                        <xsl:value-of
+                            select="//hl7:ClinicalDocument/hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:functionCode/hl7:originalText"
+                        />
+                    </xsl:attribute>
+                </xsl:element>
+            </xsl:element>
+
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Problems -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.5.1']">
+        <xsl:copy>
+            <templateId typeCode="action" root="2.16.840.1.113883.3.632.6.1.1"/>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!--Treating provider -->
+    <!-- Problem Description/Details -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.5.1']/hl7:entry/hl7:act/hl7:entryRelationship/hl7:observation">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <xsl:element name="performer">
+                <xsl:element name="assignedEntity">
+                    <xsl:element name="id">
+                        <xsl:attribute name="root">
+                            <xsl:value-of select="$qmacOID"/>
+                        </xsl:attribute>
+                    </xsl:element>
+                    <xsl:element name="code">
+                        <xsl:attribute name="code">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:code/@code"
+                            />
+                        </xsl:attribute>
+                        <xsl:attribute name="displayName">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:code/@displayName"
+                            />
+                        </xsl:attribute>
+                        <xsl:attribute name="codeSystem">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:code/@codeSystem"
+                            />
+                        </xsl:attribute>
+                        <xsl:attribute name="codeSystemName">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:code/@codeSystemName"
+                            />
+                        </xsl:attribute>
+                    </xsl:element>
+                    <xsl:element name="assignedPerson">
+                        <xsl:element name="name">
+                            <xsl:element name="given">
+                                <xsl:value-of
+                                    select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:assignedPerson/hl7:name/hl7:given"
+                                />
+                            </xsl:element>
+                            <xsl:element name="family">
+                                <xsl:value-of
+                                    select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:assignedPerson/hl7:name/hl7:family"
+                                />
+                            </xsl:element>
+                        </xsl:element>
+
+
+                    </xsl:element>
+                    <xsl:element name="telecom">
+                        <xsl:attribute name="use">
+                            <xsl:value-of select="'WP'"/>
+                        </xsl:attribute>
+                        <xsl:attribute name="value">
+                            <xsl:value-of
+                                select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:representedOrganization/hl7:telecom/@value"
+                            />
+                        </xsl:attribute>
+                    </xsl:element>
+                    <xsl:apply-templates
+                        select="//hl7:documentationOf/hl7:serviceEvent/hl7:performer[1]/hl7:assignedEntity/hl7:addr"
+                    />
+                </xsl:element>
+                <xsl:element name="functionCode">
+                    <xsl:if
+                        test="$PerformerCodeSys = '2.16.840.1.113883.12.443' or $PerformerCodeSys = '2.16.840.1.113883.5.88'">
+                        <xsl:attribute name="code">
+                            <xsl:value-of select="'PCP'"/>
+                        </xsl:attribute>
+                        <xsl:attribute name="codeSystem">
+                            <xsl:value-of select="'2.16.840.1.113883.5.88'"/>
+                        </xsl:attribute>
+                    </xsl:if>
+                    <xsl:attribute name="displayName">
+                        <xsl:value-of
+                            select="//hl7:ClinicalDocument/hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:functionCode/hl7:originalText"
+                        />
+                    </xsl:attribute>
+                </xsl:element>
+            </xsl:element>
+            <!-- Problem Description/Details --> 
+           <xsl:element name="text">
+                <xsl:value-of
+                    select="./hl7:value/@displayName[string()] | ./hl7:value/hl7:translation/@displayName[string()]"
+                />            
+    </xsl:element>  
+        </xsl:copy>
+    </xsl:template>
+        
+    <!--template for Problem Category -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.5.1']/hl7:entry/hl7:act/hl7:entryRelationship/hl7:observation/hl7:code">
+        <xsl:copy>
+            <xsl:attribute name="code">
+                <xsl:value-of select="translate(string(./@code), ' ', '-')"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="normalize-space(string(./@displayName))"/>
+            </xsl:attribute>
+            <xsl:copy-of select="node()"> </xsl:copy-of>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Problem  entering faciliity -->
+    <!-- Problem entry collection time -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.5.1']/hl7:entry/hl7:act">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <xsl:element name="author">
+                <xsl:element name="time">
+                    <xsl:attribute name="value">
+                        <xsl:value-of select="./hl7:effectiveTime/hl7:low/@value"/>
+                    </xsl:attribute>
+                </xsl:element>
+                <xsl:apply-templates select="//hl7:ClinicalDocument/hl7:author/hl7:assignedAuthor"/>
+            </xsl:element>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Vaccinations -->
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.2.1']">
+        <xsl:copy>
+            <!--OID to set ActionCode to Clear -->
+            <templateId typeCode="action" root="2.16.840.1.113883.3.632.6.1.1"/>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Order Item -->
+    <xsl:template
+        match="/hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.2.1']/hl7:entry/hl7:substanceAdministration/hl7:consumable/hl7:manufacturedProduct/hl7:manufacturedMaterial/hl7:code">
+        <xsl:copy>
+            <xsl:attribute name="code">
+                <xsl:value-of select="translate(string(./@code), ' ', '-')"/>
+            </xsl:attribute>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="normalize-space(string(./@displayName))"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Ordering facility/organization -->
+    <!-- Immunization Status -->   
+    <!--Dispensed Product -->
+    <!-- Ordering Provider -->
+    <!-- Immunization entry collection time -->     
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.2.1']/hl7:entry/hl7:substanceAdministration">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <!-- Ordering facility/organization -->
+            <xsl:element name="informant">
+                <xsl:element name="assignedEntity">
+                    <xsl:element name="representedOrganization">
+                        <xsl:element name="id">
+                            <xsl:attribute name="root">
+                                <xsl:value-of select="$qmacOID"/>
+                            </xsl:attribute>
+                        </xsl:element>
+                        <xsl:element name="name">
+                            <xsl:value-of select="isc:evaluate('getDescriptionForOID', $qmacOID)"/>
+                        </xsl:element>
+                        <xsl:apply-templates
+                            select="//hl7:author/hl7:assignedAuthor/hl7:representedOrganization/hl7:addr"/>
+                        <xsl:element name="telecom">
+                            <xsl:attribute name="use">
+                                <xsl:value-of select="'WP'"/>
+                            </xsl:attribute>
+                            <xsl:attribute name="value">
+                                <xsl:value-of
+                                    select="//hl7:ClinicalDocument/hl7:author/hl7:assignedAuthor/hl7:representedOrganization/hl7:telecom/@value"
+                                />
+                            </xsl:attribute>
+                        </xsl:element>
+                    </xsl:element>
+                </xsl:element>
+            </xsl:element>
+
+            <!-- Immunization Status --> 
+            <xsl:element name="entryRelationship">
+                <xsl:attribute name="typeCode">
+                    <xsl:value-of select="'REFR'"/>
+                </xsl:attribute>
+                <xsl:element name="observation">
+                    <xsl:element name="value">
+                        <xsl:attribute name="code">
+                            <xsl:value-of select="55561003"/>
+                        </xsl:attribute>
+                        <xsl:value-of select="hl7:statusCode"/>
+                    </xsl:element>
+                </xsl:element>
+
+                <!--Dispensed Product -->
+                <xsl:element name="supply">
+                    <xsl:attribute name="moodCode">
+                        <xsl:value-of select="'EVN'"/>
+                    </xsl:attribute>
+                    <xsl:element name="product">
+                        <xsl:element name="manufacturedProduct">
+                            <xsl:element name="manufacturedMaterial">
+                                <xsl:element name="code">
+                                    <xsl:attribute name="codeSystemName">
+                                        <xsl:value-of
+                                            select="./hl7:consumable/hl7:manufacturedProduct/hl7:manufacturedMaterial/hl7:code/@codeSystemName"
+                                        />
+                                    </xsl:attribute>
+                                    <xsl:attribute name="code">
+                                        <xsl:value-of
+                                            select="./hl7:consumable/hl7:manufacturedProduct/hl7:manufacturedMaterial/hl7:code/@code"
+                                        />
+                                    </xsl:attribute>
+                                    <xsl:attribute name="displayName">
+                                        <xsl:value-of
+                                            select="./hl7:consumable/hl7:manufacturedProduct/hl7:manufacturedMaterial/hl7:code/@displayName"
+                                        />
+                                    </xsl:attribute>
+                                </xsl:element>
+                                <xsl:element name="name">
+                                    <xsl:value-of
+                                        select="./hl7:consumable/hl7:manufacturedProduct/hl7:manufacturedMaterial/hl7:code/@displayName"
+                                    />
+                                </xsl:element>
+                            </xsl:element>
+                        </xsl:element>
+                    </xsl:element>
+                </xsl:element>
+            </xsl:element>
+            
+			<!-- Immunization entry collection time --> 
+            <xsl:element name="entryRelationship">
+                <xsl:attribute name="typeCode">
+                    <xsl:value-of select="'REFR'"/>
+                </xsl:attribute>
+                <xsl:element name="supply">
+                    <xsl:attribute name="moodCode">
+                        <xsl:value-of select="'INT'"/>
+                    </xsl:attribute>
+                    <xsl:element name="author">
+                        <xsl:element name="assignedAuthor">
+                            <xsl:element name="assignedPerson">
+                                <xsl:element name="name">
+                                    <xsl:element name="given">
+                                        <xsl:value-of
+                                            select="//hl7:ClinicalDocument/hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:assignedPerson/hl7:name/hl7:given"
+                                        />
+                                    </xsl:element>
+                                    <xsl:element name="family">
+                                        <xsl:value-of
+                                            select="//hl7:ClinicalDocument/hl7:documentationOf/hl7:serviceEvent/hl7:performer/hl7:assignedEntity/hl7:assignedPerson/hl7:name/hl7:family"
+                                        />
+                                    </xsl:element>
+                                </xsl:element>
+                            </xsl:element>
+                        </xsl:element>
+                    </xsl:element>
+
+                </xsl:element>
+            </xsl:element>
+
+            <!-- Immunization entry collection time -->
+            <xsl:element name="author">
+                <xsl:element name="time">
+                    <xsl:attribute name="value">
+                        <xsl:value-of select="./hl7:effectiveTime/@value"/>
+                    </xsl:attribute>
+                </xsl:element>
+                <xsl:apply-templates select="//hl7:ClinicalDocument/hl7:author/hl7:assignedAuthor"/>
+            </xsl:element>
+
+        </xsl:copy>
+    </xsl:template>
+
+
+    <!-- Mappping to set id root value to multiple iterations for placer id and filler id mapping -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.2.1']/hl7:entry/hl7:substanceAdministration/hl7:id">
+        <xsl:variable name="identifier" select="./@extension"/>
+        <xsl:copy>
+            <xsl:attribute name="root">
+                <xsl:value-of select="$identifier"/>
+            </xsl:attribute>
+        </xsl:copy>
+        <xsl:element name="id">
+            <xsl:attribute name="root">
+                <xsl:value-of select="$identifier"/>
+            </xsl:attribute>
+        </xsl:element>
+        <xsl:element name="id">
+            <xsl:attribute name="root">
+                <xsl:value-of select="$identifier"/>
+            </xsl:attribute>
+        </xsl:element>
+    </xsl:template>
+
+    <!-- Map Immunizations manufacuredMaterial @code -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.2.1']/hl7:entry/hl7:substanceAdministration/hl7:consumable/hl7:manufacturedProduct/hl7:manufacturedMaterial/hl7:code">
+        <xsl:copy>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+            <xsl:attribute name="code">
+                <xsl:value-of select="translate(string(./@code), ' ', '-')"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="normalize-space(string(./@displayName))"/>
+            </xsl:attribute>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Map Vaccinations RouteCode @displayName -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.2.1']/hl7:entry/hl7:substanceAdministration/hl7:entryRelationship[@typeCode = 'REFR']/hl7:supply[@moodCode = 'EVN']/hl7:product/hl7:manufacturedProduct/hl7:manufacturedMaterial/hl7:name">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!--  Social History  -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.17']">
+        <xsl:copy>
+            <templateId typeCode="action" root="2.16.840.1.113883.3.632.6.1.1"/>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Social habit -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.17']/hl7:entry/hl7:observation[not(hl7:templateId/@root = '2.16.840.1.113883.10.20.22.4.78')]/hl7:code">
+        <xsl:copy>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+            <xsl:attribute name="code">
+                <xsl:value-of select="translate(string(./@code), ' ', '-')"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="normalize-space(string(./@displayName))"/>
+            </xsl:attribute>
+            <xsl:copy-of select="node()"> </xsl:copy-of>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Smoking Status Code -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.17']/hl7:entry/hl7:observation[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.4.78']/hl7:value">
+        <xsl:copy>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+            <xsl:attribute name="code">
+                <xsl:value-of select="translate(string(./@code), ' ', '-')"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="normalize-space(string(./@displayName))"/>
+            </xsl:attribute>
+            <xsl:copy-of select="node()"> </xsl:copy-of>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Social History Status-->
+	<!-- Social History  entering faciliity -->
+	<!--  Social History entry collection time  -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.17']/hl7:entry/hl7:observation">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <xsl:element name="entryRelationship">
+                <xsl:attribute name="typeCode">
+                    <xsl:value-of select="'REFR'"/>
+                </xsl:attribute>
+                <xsl:element name="observation">
+                    <xsl:element name="code">
+                        <xsl:attribute name="code">
+                            <xsl:value-of select="'33999-4'"/>
+                        </xsl:attribute>
+                    </xsl:element>
+                    <xsl:element name="value">
+                        <xsl:attribute name="code">
+                            <xsl:value-of select="./hl7:statusCode/@code"/>
+                        </xsl:attribute>
+                    </xsl:element>
+                </xsl:element>
+            </xsl:element>
+            <xsl:element name="author">
+                <xsl:element name="time">
+                    <xsl:attribute name="value">
+                        <xsl:value-of select="./hl7:effectiveTime/@value"/>
+                    </xsl:attribute>
+                </xsl:element>
+                <xsl:apply-templates select="//hl7:ClinicalDocument/hl7:author/hl7:assignedAuthor"/>
+            </xsl:element>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Medications -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']">
+        <xsl:copy>
+            <!--OID to set ActionCode to Clear -->
+            <templateId typeCode="action" root="2.16.840.1.113883.3.632.6.1.1"/>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']/hl7:entry/hl7:substanceAdministration[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.4.16']/hl7:id">
+        <xsl:variable name="identifier" select="./@extension"/>
+        <xsl:copy>f
+            <xsl:attribute name="root">
+                <xsl:value-of select="$identifier"/>
+            </xsl:attribute>
+        </xsl:copy>
+        <xsl:element name="id">
+            <xsl:attribute name="root">
+                <xsl:value-of select="$identifier"/>
+            </xsl:attribute>
+        </xsl:element>
+    </xsl:template>
+
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']/hl7:entry/hl7:substanceAdministration[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.4.16']/hl7:consumable/hl7:manufacturedProduct/hl7:manufacturedMaterial/hl7:name/text()">
+        <xsl:variable name="newString">
+            <xsl:call-template name="string-trim">
+                <xsl:with-param name="string" select="string(.)"/>
+            </xsl:call-template>
+        </xsl:variable>
+        <xsl:copy>
+            <xsl:apply-templates select="$newString"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']/hl7:entry/hl7:substanceAdministration[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.4.16']/hl7:entryRelationship[@typeCode = 'COMP']/hl7:substanceAdministration/hl7:code/@code">
+        <xsl:variable name="newString">
+            <xsl:call-template name="string-trim">
+                <xsl:with-param name="string" select="string(.)"/>
+            </xsl:call-template>
+        </xsl:variable>
+        <xsl:attribute name="displayName">
+            <xsl:value-of select="$newString"/>
+        </xsl:attribute>
+    </xsl:template>
+
+    <!-- Map Medications RouteCode @code -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']/hl7:entry/hl7:substanceAdministration[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.4.16']/hl7:routeCode/@code">
+        <xsl:attribute name="code">
+            <xsl:value-of select="translate(string(.), ' ', '_')"/>
+        </xsl:attribute>
+    </xsl:template>
+
+    <!-- Map Medications RouteCode @displayName -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']/hl7:entry/hl7:substanceAdministration[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.4.16']/hl7:routeCode">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <xsl:variable name="tcode" select="./@code"/>
+            <xsl:attribute name="codeSystem">
+                <xsl:value-of select="./@codeSystem"/>
+            </xsl:attribute>
+            <xsl:attribute name="codeSystemName">
+                <xsl:value-of select="./@codeSystemName"/>
+            </xsl:attribute>
+            <xsl:attribute name="displayName">
+                <xsl:value-of select="isc:evaluate('getRouteCode', $tcode)"/>
+            </xsl:attribute>
+        </xsl:copy>
+    </xsl:template>
+
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']/hl7:text/hl7:table//hl7:content/text()"> </xsl:template>
+
+
+    <!-- Ordering facility/organization -->
+    <!-- Medication entry collection time -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']/hl7:entry/hl7:substanceAdministration">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <!-- Order Category -->
+            <!-- Pharmacy Status -->
+            <xsl:element name="orderCategory">
+                <xsl:value-of select="'Home Medications'"/>
+            </xsl:element>
+            <xsl:element name="pharmacyStatus">
+                <xsl:value-of select="'Home Medications'"/>
+            </xsl:element>
+
+            <!-- Ordering facility/organization -->
+            <xsl:element name="informant">
+                <xsl:element name="assignedEntity">
+                    <xsl:element name="representedOrganization">
+                        <xsl:element name="id">
+                            <xsl:attribute name="root">
+                                <xsl:value-of select="$qmacOID"/>
+                            </xsl:attribute>
+                        </xsl:element>
+                        <xsl:element name="name">
+                            <xsl:value-of select="isc:evaluate('getDescriptionForOID', $qmacOID)"/>
+                        </xsl:element>
+                        <xsl:apply-templates
+                            select="//hl7:author/hl7:assignedAuthor/hl7:representedOrganization/hl7:addr"/>
+                        <xsl:element name="telecom">
+                            <xsl:attribute name="use">
+                                <xsl:value-of select="'WP'"/>
+                            </xsl:attribute>
+                            <xsl:attribute name="value">
+                                <xsl:value-of
+                                    select="//hl7:ClinicalDocument/hl7:author/hl7:assignedAuthor/hl7:representedOrganization/hl7:telecom/@value"
+                                />
+                            </xsl:attribute>
+                        </xsl:element>
+                    </xsl:element>
+                </xsl:element>
+            </xsl:element>
+
+            <!-- Medication entry collection time -->
+            <xsl:element name="author">
+                <xsl:element name="time">
+                    <xsl:attribute name="value">
+                        <xsl:value-of
+                            select="./hl7:entryRelationship[@typeCode = 'REFR']/hl7:supply[@moodCode = 'INT']/hl7:author/hl7:time/@value"
+                        />
+                    </xsl:attribute>
+                </xsl:element>
+                <xsl:apply-templates select="//hl7:ClinicalDocument/hl7:author/hl7:assignedAuthor"/>
+            </xsl:element>
+
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Dispensed Product -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.1.1']/hl7:entry/hl7:substanceAdministration/hl7:entryRelationship/hl7:supply/hl7:product/hl7:manufacturedProduct/hl7:manufacturedMaterial">
+        <xsl:copy>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+            <xsl:element name="name">
+                <xsl:value-of select="hl7:code/@displayName"/>
+            </xsl:element>
+        </xsl:copy>
+    </xsl:template>
+
+
+    <!-- Vital Sign -->
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.4.1']">
+        <xsl:copy>
+            <!--OID to set ActionCode to Clear -->
+            <templateId typeCode="action" root="2.16.840.1.113883.3.632.6.1.1"/>
+            <xsl:apply-templates select="@*"/>
+            <xsl:apply-templates select="node()"/>
+        </xsl:copy>
+    </xsl:template>
+
+    <!-- Block Advance Directive -->
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component[hl7:section/hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.21']"/>
+
+    <!-- Block Results -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.3.1']"/>
+
+    <!-- Block Treatment Plan -->
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.10']"/>
+
+    <!-- Block Medical Equipment -->
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.23']"/>
+
+    <!-- Block Mental Status -->
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.56']"/>
+
+    <!-- Block Payment Source -->
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.18']"/>
+
+    <!-- Block History of Encounters -->
+    <xsl:template
+        match="//hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.22.1']"/>
+
+ 	<!-- Block Procedures -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.7.1']"/>
+        
+        
+	<!-- Block Functional and cognitive status section -->
+    <xsl:template
+        match="//hl7:ClinicalDocument/hl7:component/hl7:structuredBody/hl7:component/hl7:section[hl7:templateId/@root = '2.16.840.1.113883.10.20.22.2.14']"/>        
+
+    <!-- Strips trailing whitespace characters from 'string' -->
+    <xsl:variable name="whitespace" select="'&#09;&#10;&#13; '"/>
+
+    <xsl:template name="string-rtrim">
+        <xsl:param name="string"/>
+        <xsl:param name="trim" select="$whitespace"/>
+        <xsl:variable name="length" select="string-length($string)"/>
+        <xsl:if test="$length &gt; 0">
+            <xsl:choose>
+                <xsl:when test="contains($trim, substring($string, $length, 1))">
+                    <xsl:call-template name="string-rtrim">
+                        <xsl:with-param name="string" select="substring($string, 1, $length - 1)"/>
+                        <xsl:with-param name="trim" select="$trim"/>
+                    </xsl:call-template>
+                </xsl:when>
+                <xsl:otherwise>
+                    <xsl:value-of select="$string"/>
+                </xsl:otherwise>
+            </xsl:choose>
+        </xsl:if>
+    </xsl:template>
+
+    <!-- Strips leading whitespace characters from 'string' -->
+    <xsl:template name="string-ltrim">
+        <xsl:param name="string"/>
+        <xsl:param name="trim" select="$whitespace"/>
+        <xsl:if test="string-length($string) &gt; 0">
+            <xsl:choose>
+                <xsl:when test="contains($trim, substring($string, 1, 1))">
+                    <xsl:call-template name="string-ltrim">
+                        <xsl:with-param name="string" select="substring($string, 2)"/>
+                        <xsl:with-param name="trim" select="$trim"/>
+                    </xsl:call-template>
+                </xsl:when>
+                <xsl:otherwise>
+                    <xsl:value-of select="$string"/>
+                </xsl:otherwise>
+            </xsl:choose>
+        </xsl:if>
+    </xsl:template>
+
+    <!-- Strips leading and trailing whitespace characters from 'string' -->
+    <xsl:template name="string-trim">
+        <xsl:param name="string"/>
+        <xsl:param name="trim" select="$whitespace"/>
+        <xsl:call-template name="string-rtrim">
+            <xsl:with-param name="string">
+                <xsl:call-template name="string-ltrim">
+                    <xsl:with-param name="string" select="$string"/>
+                    <xsl:with-param name="trim" select="$trim"/>
+                </xsl:call-template>
+            </xsl:with-param>
+            <xsl:with-param name="trim" select="$trim"/>
+        </xsl:call-template>
+    </xsl:template>
+
+</xsl:stylesheet>
+}
+
+Storage Default
+{
+<Data name="QmacOncoEmrCcdToHealthshareDefaultData">
+<Subscript>"QmacOncoEmrCcdToHealthshare"</Subscript>
+<Value name="1">
+<Value>TraceOperations</Value>
+</Value>
+<Value name="2">
+<Value>XSLTCallbackHandlerClass</Value>
+</Value>
+<Value name="3">
+<Value>Target</Value>
+</Value>
+<Value name="4">
+<Value>CDALoggingConfig</Value>
+</Value>
+<Value name="5">
+<Value>CDALoggingPath</Value>
+</Value>
+<Value name="6">
+<Value>CallbackHandler</Value>
+</Value>
+<Value name="7">
+<Value>ErrorHandler</Value>
+</Value>
+<Value name="8">
+<Value>DoHSTrace</Value>
+</Value>
+<Value name="9">
+<Value>ClearCallbackVariables</Value>
+</Value>
+<Value name="10">
+<Value>UseXSLT2</Value>
+</Value>
+<Value name="11">
+<Value>XSLTCacheMode</Value>
+</Value>
+<Value name="12">
+<Value>XSLTDirectory</Value>
+</Value>
+<Value name="13">
+<Value>XSLTErrorHandlerClass</Value>
+</Value>
+</Data>
+<DefaultData>QmacOncoEmrCcdToHealthshareDefaultData</DefaultData>
+<Type>%Library.CacheStorage</Type>
+}
+
+}
