@@ -1,0 +1,119 @@
+Include HS.Common
+
+/// Custom Web Service methods to be run on the Registry
+Class CUSTOM.EDGE.WS.WebServices Extends EnsLib.SOAP.Service
+{
+
+Parameter ADAPTER;
+
+Parameter USEBOTH = 0;
+
+Parameter NAMESPACE = "http://www.northshorelij.com/healthshare/registry";
+
+Parameter SERVICECLASSNAME = "CUSTOM.EDGE.WS.WebServices";
+
+/// Name of the WebService.
+Parameter SERVICENAME = "CUSTOM.EDGE.WS.WebServices";
+
+/// ECR Target
+Property ECRTarget As %String(MAXLEN = 1000);
+
+/// Flag to control when the MPI should be updated.  If not set, the DefaultMPIUpdateMode
+/// on the MPIUpdateManager will be used.  Values are:
+///   - Always: Always update the MPI regardless
+///   - IfNeeded: Only update the MPI if a change was detected
+///   - IfInsert: Only update the MPI if an insert was detected (or Merge or Delete)
+///   - Never: Never update the MPI (Only use if HealthShare is not maintaining an MPI)
+///   - ADTOnly: Only update the MPI when processing an ADT message (or if Insert)
+Property MPIUpdateMode As %String(DISPLAYLIST = ",Always,If Needed,If Insert,Never,ADT Only", VALUELIST = ",Always,IfNeeded,IfInsert,Never,ADTOnly");
+
+Parameter SETTINGS = "ECRTarget:Basic:selector?multiSelect=1&context={Ens.ContextSearch/ProductionItems?targets=1&productionName=@productionId},MPIUpdateMode";
+
+Method OnProcessInput(pInput As %RegisteredObject, ByRef pOutput As %RegisteredObject, ByRef pHint As %String = "") As %Status
+{
+	Set tSC = $$$OK
+	For iTarget=1:1:$L(..ECRTarget, ",") { 
+				Set tOneTarget=$ZStrip($P(..ECRTarget,",",iTarget),"<>W")  Continue:""=tOneTarget
+				Set tSC1=..SendRequestAsync(tOneTarget, pInput, .pOutput)  Set:$$$ISERR(tSC1) tSC=$$$ADDSC(tSC,tSC1)
+			}
+	Quit tSC
+}
+
+/// <p>This method will accept facility code and SDA stream to send to ECR.</p>
+Method SendClinicalData(pRequest As CUSTOM.Util.Message.SendClinicalDataRequest) As CUSTOM.Util.Message.SendClinicalDataResponse [ WebMethod ]
+{
+	set tRequest=##class(HS.Message.ECRUpdateRequest).%New()
+	Set tSC=tRequest.ContentStream.CopyFrom(pRequest.SdaXmlStreamData)
+	Set tRequest.StreamContentType="SDA3"
+	Set tRequest.MPIUpdateFlag=..MPIUpdateMode
+
+	Set tResponse = ##class(CUSTOM.Util.Message.SendClinicalDataResponse).%New()
+	Set tSC = ..ProcessInput(tRequest, .tECRResponse)
+	
+	
+    if $$$ISERR(tSC)
+    {
+	    set tResponse.Status = tSC
+	    set tResponse.ErrorMessage = "ECR Inbound Process errored"    //include error details???
+    }
+    else
+    {
+    	set tResponse.Status = tSC
+    	set tResponse.ResponseMessage = "ECR Inbound Process successful"
+    }
+    
+	Quit tResponse
+}
+
+Method SendClinicalDataWithEkg(pRequest As CUSTOM.Util.Message.SendClinicalDataRequest) As CUSTOM.Util.Message.SendClinicalDataResponse [ WebMethod ]
+{
+	set tRequest=##class(HS.Message.ECRUpdateRequest).%New()
+	Set tSC=tRequest.ContentStream.CopyFrom(pRequest.SdaXmlStreamData)
+	Set tRequest.StreamContentType="SDA3"
+	Set tRequest.MPIUpdateFlag=..MPIUpdateMode
+
+	Set tResponse = ##class(CUSTOM.Util.Message.SendClinicalDataResponse).%New()
+	Set tSC = ..ProcessInput(tRequest, .tECRResponse)
+	
+	
+    if $$$ISERR(tSC)
+    {
+	    set tResponse.Status = tSC
+	    set tResponse.ErrorMessage = "ECR Inbound Process errored"    //include error details???
+    }
+    else
+    {
+    	set tResponse.Status = tSC
+    	set tResponse.ResponseMessage = "ECR Inbound Process successful"
+    }
+    
+	Quit tResponse
+}
+
+/// <p>This method will accept source and target facility code and CDA stream to send to ECR.</p>
+Method SendCdaClinicalData(pRequest As CUSTOM.Util.Message.SendCdaClinicalDataRequest) As CUSTOM.Util.Message.SendCdaClinicalDataResponse [ WebMethod ]
+{
+	set tRequest=##class(HS.Message.XMLMessage).%New()
+	Set tSC=tRequest.ContentStream.CopyFrom(pRequest.CdaXmlStreamData)
+	Set tRequest.DocType=pRequest.SourceFacilityCode_"_CDA"
+	
+
+	Set tResponse = ##class(CUSTOM.Util.Message.SendCdaClinicalDataResponse).%New()
+	Set tSC = ..ProcessInput(tRequest, .tECRResponse)
+	
+	
+    if $$$ISERR(tSC)
+    {
+	    set tResponse.Status = tSC
+	    set tResponse.ErrorMessage = "ECR Inbound Process errored"    //include error details???
+    }
+    else
+    {
+    	set tResponse.Status = tSC
+    	set tResponse.ResponseMessage = "ECR Inbound Process successful"
+    }
+    
+	Quit tResponse
+}
+
+}
